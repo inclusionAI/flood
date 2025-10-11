@@ -400,14 +400,23 @@ def seg_la_s_kernel(
     )
     state = tl.load(s_ptrs, mask=s_scale>0).to(tl.float32)
 
-    q = tl.load(q_ptrs).to(tl.float32)
-    k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
-    v = tl.load(v_ptrs).to(tl.float32)
-    mask = tl.load(Mask + bid * BLOCK * BLOCK + tl.arange(0, BLOCK)[:,None]*BLOCK + tl.arange(0, BLOCK)[None,:]).to(tl.int32)
-    positions = tl.sum(mask, 1) - 1
-    max_pos = tl.max(positions)
+    if EVEN:
+        q = tl.load(q_ptrs).to(tl.float32)
+        k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
+        v = tl.load(v_ptrs).to(tl.float32)
+        mask = tl.load(Mask + bid * BLOCK * BLOCK + tl.arange(0, BLOCK)[:,None]*BLOCK + tl.arange(0, BLOCK)[None,:]).to(tl.int32)
+        positions = tl.sum(mask, 1) - 1
+        max_pos = tl.max(positions)
+        b_offs = max_pos - positions
+    else:
+        q = tl.load(q_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
+        k = tl.trans(tl.load(k_ptrs, mask=offs_b[:,None] < q_length)).to(tl.float32)
+        v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
+        mask = tl.load(Mask + bid * q_length * q_length + tl.arange(0, BLOCK)[:,None]*q_length + tl.arange(0, BLOCK)[None,:], mask=(tl.arange(0, BLOCK)[:,None]<q_length) & (tl.arange(0, BLOCK)[None,:]<q_length)).to(tl.int32)
+        positions = tl.sum(mask, 1) - 1
+        max_pos = tl.max(positions)
+        b_offs = max_pos - positions
 
-    b_offs = max_pos - positions
     decays = tl.exp(decay_scale * b_offs)
     inv_decays = 1/decays
 
@@ -420,8 +429,10 @@ def seg_la_s_kernel(
     block_decay = tl.exp(decay_scale*(max_pos+1))
     o = tl.dot(q, state) * block_decay * softmax_scale + o
 
-    tl.store(out_ptrs, o.to(Out.dtype.element_ty))
-
+    if EVEN:
+        tl.store(out_ptrs, o.to(Out.dtype.element_ty))
+    else:
+        tl.store(out_ptrs, o.to(Out.dtype.element_ty), mask=offs_b[:,None] < q_length)
 
 # used for decode
 @triton.jit
@@ -507,48 +518,34 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
     tl.store(O + pid * DIM + tl.arange(0, DIM), x)
 
 
-@dataclass
-class SegLaMeta:
-    batch_size: int  # requested number. len(num_prefills)
-    max_q_length: int  # max(seq_lens)
-    q_offsets: torch.Tensor  # query_start_loc
-    s_offsets: torch.Tensor  # slot_ids
-    q_lengths: torch.Tensor  # diff(query_start_loc)
-    s_scales: torch.Tensor  # num_prefills prefill = 0, decode = 1
-    s_offsets_stride: int = 0
-    q_offsets_stride: int = 0
-    s_scales_stride: int = 0
-    decay_scales_stride: int = 0
-    mask: Optional[torch.Tensor] = None  # Currently not supported
-
 
 def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=False):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
     if softmax_scale is None:
-        softmax_scale = HEAD_DIM ** (-0.5)  # 1.0 / math.sqrt(d)
+        softmax_scale = HEAD_DIM ** (-0.5)
 
-    MAX_LENGTH = triton.cdiv(length, bs)  # meta.max_q_length
+    MAX_LENGTH = meta.max_q_length
+    # MAX_LENGTH = triton.cdiv(length, bs)
 
     assert qo_heads == kv_heads, "seg_la does NOT support GQA currently"
 
     if MAX_LENGTH > 1:
         # prefill with partitoning q/k/v
-        #  BLOCK should <= 64 with decouple
-        if bs <= 2:
-            BLOCK = 32 if meta.mask is None else meta.mask.size(-1) # 32
-            K_SPLIT_DIM = 32  # 32
-            V_SPLIT_DIM = 32  # 32
-            num_warps = 2  # 2
-            num_stages = 3  # 3
+        # BLOCK should <= 64 with decouple
+        K_SPLIT_DIM = 32
+        V_SPLIT_DIM = 32 if bs <= 2 else 64
+        if meta.mask is None:
+            BLOCK = 32 
+            EVEN = MAX_LENGTH % BLOCK == 0 if bs == 1 else False
         else:
-            BLOCK = 32
-            K_SPLIT_DIM = 32 if meta.mask is None else meta.mask.size(-1)
-            V_SPLIT_DIM = 64
-            num_warps = 2  # 2
-            num_stages = 3  # 3
-        EVEN = MAX_LENGTH % BLOCK == 0 if bs == 1 else False
+            ms = meta.mask.size(-1)
+            BLOCK = (ms + 15) // 16 * 16
+            EVEN = BLOCK == ms
+
+        num_warps = 2  # 2
+        num_stages = 3  # 3
 
         k_dim_block = HEAD_DIM // K_SPLIT_DIM
         v_dim_block = HEAD_DIM // V_SPLIT_DIM

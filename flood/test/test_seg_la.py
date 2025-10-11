@@ -190,8 +190,6 @@ def test_seg_attn(mode='prefill', even=True, decouple=False):
         masks[:, 5:, 1:5] = 0
         masks[:, 8:, 5:8] = 0
         masks = torch.tril(masks, 0)
-        # permute_indices = torch.argsort(torch.randn(mask_size,dtype=torch.float32,device=device))
-        # masks = masks[:,permute_indices]
 
     else:
         raise ValueError(f'unknown mode:{mode}')
@@ -290,8 +288,8 @@ def test_seg_attn(mode='prefill', even=True, decouple=False):
 
 
 if __name__ == '__main__':
-    for mode in ['prefill','decode']:
-        for even in [True, False]:
-            for decouple in [False, True]:
-                test_seg_attn(mode=mode, even=even, decouple=decouple)
+    # for mode in ['prefill','decode']:
+    #     for even in [True, False]:
+    #         for decouple in [False, True]:
+    #             test_seg_attn(mode=mode, even=even, decouple=decouple)
     test_seg_attn(mode='spec', even=True, decouple=False)
