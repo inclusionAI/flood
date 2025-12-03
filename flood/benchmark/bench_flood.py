@@ -36,13 +36,14 @@ if __name__ == "__main__":
     # reqs = Reader.read_sharegpt_dataset(data_path, model_path, max_count=10000)
 
     data_path = '/mntnlp/nanxiao/dataset/gsm_8k/test.jsonl'
+    warmup_reqs = Reader.read_jsonl_dataset(data_path, model_path, prompt_name='prompt', max_count=1024, output_length=4096)
     reqs = Reader.read_jsonl_dataset(data_path, model_path, prompt_name='prompt', max_count=1024, output_length=4096)
 
 
     # load model
     n_stage = 1
     n_proc = 1
-    eos_token_id = None # ()  # set eos_token_id = () to make it ignore eos
+    eos_token_id = None  # ()  # set eos_token_id = () to make it ignore eos
     worker = LLM(model_path,
                 #  model_dtype=torch.bfloat16,
                 #  head_dtype=torch.bfloat16,
@@ -56,7 +57,7 @@ if __name__ == "__main__":
                 schedule_mode="pingpong",
                 chunk_size=1024,
                 sync_wait_time=(4.0, 4.0),
-                queue_timeout=0.001,
+                queue_timeout=0.0001,
                 max_slot_alloc_fail_count=1,
                 alloc_early_exit_rate=0.95,
                 slot_fully_alloc_under=10240,
@@ -68,11 +69,11 @@ if __name__ == "__main__":
                 batch_size_round_frac=0.0,  # 0.585
                 min_decode_rate=0.8,  # 0.8
                 kernels=("sa",),
-                # spec_algo='lookahead',
-                # max_spec_branch_count=4,
-                # spec_branch_length=4,
-                # spec_token_budget_count=128,
-                # use_spec_min_batch_size=32,
+                spec_algo='lookahead',
+                max_spec_branch_count=4,
+                spec_branch_length=4,
+                spec_token_budget_count=128,
+                use_spec_min_batch_size=32,
                 eos_token_id=eos_token_id,
                 logger="benchmark.log",
                 debug=True,
@@ -83,13 +84,13 @@ if __name__ == "__main__":
     worker.launch(input_queue, chunk_queue, working_queue, output_queues)
 
     # warmup
-    worker.generate(warmup_reqs, input_queue, output_queues, print_count=0)
+    worker.generate(warmup_reqs[:64], input_queue, output_queues, print_count=0)
     time.sleep(1)
 
     # do benchmark
     print(f"\n*********  start benchmark:{time.time() % 1000:.3f}  ***********\n")
     for i, req in enumerate(
-        worker.request_stream_generate(reqs[:128], input_queue, output_queues, print_count=0)
+        worker.request_stream_generate(reqs[64:128], input_queue, output_queues, print_count=0)
     ):
         if i <= -1:
             print("\n\n")
