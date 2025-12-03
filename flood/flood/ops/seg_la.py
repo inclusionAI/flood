@@ -570,7 +570,7 @@ def seg_la_mtp_kernel(
     # (bs, step, kv_heads, d, d)
     c_ptrs = (
         CACHES
-        + bid * stride_c
+        + s_offset * stride_c
         + hid * HEAD_DIM * HEAD_DIM
         + kid * HEAD_DIM * K_SPLIT_DIM
         + vid * V_SPLIT_DIM
