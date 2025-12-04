@@ -335,6 +335,8 @@ def seg_la_s_kernel(
         Q,
         K,
         V,
+        KC,
+        VC,
         S,
         Out,
         Mask,
@@ -342,6 +344,8 @@ def seg_la_s_kernel(
         stride_q,
         stride_k,
         stride_v,
+        stride_kc,
+        stride_vc,
         stride_s,
         stride_o,
         s_offsets,
@@ -353,7 +357,8 @@ def seg_la_s_kernel(
         K_SPLIT_DIM: tl.constexpr,
         V_SPLIT_DIM: tl.constexpr,
         BLOCK: tl.constexpr,
-        EVEN: tl.constexpr
+        EVEN: tl.constexpr,
+        DUMP: tl.constexpr
 ):  
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -363,7 +368,7 @@ def seg_la_s_kernel(
     vid = kvid % N
     H = tl.num_programs(1)
 
-    # s_scale is 0 (first prefill chunk) or 1 (next prefill chunk)
+    # s_scale is 0 (first prefill chunk) or 1 (next prefill chunk or decode)
     s_scale = tl.load(s_scales+bid)
     q_length = tl.load(q_lengths + bid)
     q_offset = tl.load(q_offsets + bid)
@@ -377,6 +382,7 @@ def seg_la_s_kernel(
     if s_offset == -1:
         return
 
+    #  (bs*mask_size, q_heads, d)
     q_ptrs = (
             Q + q_offset * stride_q + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
                 offs_b[:, None] * stride_q + offs_k[None, :])
@@ -389,11 +395,7 @@ def seg_la_s_kernel(
             V + q_offset * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM +  (
                 offs_b[:, None] * stride_v + offs_v[None, :])
     )
-    # (num_dim_block, length, qo_heads, d)
-    out_ptrs = (
-            Out + kid * stride_o + q_offset * HEAD_DIM * H + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
-                offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
-    )
+    # (bs, kv_heads, d, d)
     s_ptrs =  (
             S + s_offset * stride_s + hid * HEAD_DIM * HEAD_DIM + kid * HEAD_DIM * K_SPLIT_DIM + vid * V_SPLIT_DIM + (
                 offs_k[:, None] * HEAD_DIM + offs_v[None, :])
@@ -402,17 +404,48 @@ def seg_la_s_kernel(
 
     if EVEN:
         q = tl.load(q_ptrs).to(tl.float32)
-        k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
-        v = tl.load(v_ptrs).to(tl.float32)
+        if DUMP:
+            k = tl.load(k_ptrs)
+            # (bs, mask_size, kv_heads, d)
+            kc_ptrs = (KC + s_offset * stride_kc + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_k + offs_k[None, :]))
+            tl.store(kc_ptrs, k)
+            k = tl.trans(k).to(tl.float32)
+            v = tl.load(v_ptrs)
+            vc_ptrs = (VC + s_offset * stride_vc + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * stride_v + offs_v[None, :]))
+            tl.store(vc_ptrs, v)
+            v = v.to(tl.float32)
+        else:
+            k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
+            v = tl.load(v_ptrs).to(tl.float32)
+
         mask = tl.load(Mask + bid * BLOCK * BLOCK + tl.arange(0, BLOCK)[:,None]*BLOCK + tl.arange(0, BLOCK)[None,:]).to(tl.int32)
+        
         positions = tl.sum(mask, 1) - 1
         max_pos = tl.max(positions)
         b_offs = max_pos - positions
     else:
         q = tl.load(q_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
-        k = tl.trans(tl.load(k_ptrs, mask=offs_b[:,None] < q_length)).to(tl.float32)
-        v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
-        mask = tl.load(Mask + bid * q_length * q_length + tl.arange(0, BLOCK)[:,None]*q_length + tl.arange(0, BLOCK)[None,:], mask=(tl.arange(0, BLOCK)[:,None]<q_length) & (tl.arange(0, BLOCK)[None,:]<q_length)).to(tl.int32)
+        if DUMP:
+            k = tl.load(k_ptrs, mask=offs_b[:,None] < q_length)
+            # (bs, mask_size, kv_heads, d)
+            kc_ptrs = (KC + s_offset * stride_kc + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_k + offs_k[None, :]))
+            tl.store(kc_ptrs, k, mask=offs_b[:,None] < q_length)
+            k = tl.trans(k).to(tl.float32)
+            v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length)
+            vc_ptrs = (VC + s_offset * stride_vc + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * stride_v + offs_v[None, :]))
+            tl.store(vc_ptrs, v, mask=offs_b[:,None] < q_length)
+            v = v.to(tl.float32)
+        else:
+            k = tl.trans(tl.load(k_ptrs, mask=offs_b[:,None] < q_length)).to(tl.float32)
+            v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
+        mask = tl.load(Mask + bid * q_length * q_length +
+                        tl.arange(0, BLOCK)[:,None]*q_length +
+                        tl.arange(0, BLOCK)[None,:],
+                        mask=(tl.arange(0, BLOCK)[:,None]<q_length) & (tl.arange(0, BLOCK)[None,:]<q_length)).to(tl.int32)
         positions = tl.sum(mask, 1) - 1
         max_pos = tl.max(positions)
         b_offs = max_pos - positions
@@ -429,10 +462,16 @@ def seg_la_s_kernel(
     block_decay = tl.exp(decay_scale*(max_pos+1))
     o = tl.dot(q, state) * block_decay * softmax_scale + o
 
+    # (num_dim_block, length, qo_heads, d)
+    out_ptrs = (
+            Out + kid * stride_o + q_offset * HEAD_DIM * H + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
+    )
     if EVEN:
         tl.store(out_ptrs, o.to(Out.dtype.element_ty))
     else:
         tl.store(out_ptrs, o.to(Out.dtype.element_ty), mask=offs_b[:,None] < q_length)
+
 
 # used for decode
 @triton.jit
@@ -608,7 +647,7 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
 
 
 
-def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None, decouple=False):
+def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, key_cache=None, value_cache=None, softmax_scale=None):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
@@ -671,11 +710,22 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None, 
             ms = meta.mask.size(-1)
             BLOCK = (ms + 15) // 16 * 16
             EVEN = BLOCK == ms
-
+            # key_cache and value_cache are used to hold k&v in forward,
+            # they will be used in state updating stage
+            DUMP = key_cache is not None and value_cache is not None
+            if DUMP:
+                # (bs, mask_size, kv_heads, d)
+                kc_stride = key_cache.stride(0)
+                vc_stride = value_cache.stride(0)
+            else:
+                kc_stride = 0
+                vc_stride = 0
             seg_la_s_kernel[grid](
                 q,
                 k,
                 v,
+                key_cache,
+                value_cache,
                 s,
                 tmp,
                 meta.mask,
@@ -683,6 +733,8 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None, 
                 q.stride(0),
                 k.stride(0),
                 v.stride(0),
+                kc_stride,
+                vc_stride,
                 s.stride(0),
                 tmp.stride(0),
                 meta.s_offsets,
@@ -695,6 +747,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None, 
                 V_SPLIT_DIM=V_SPLIT_DIM,
                 BLOCK=BLOCK,
                 EVEN=EVEN,
+                DUMP=DUMP,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
