@@ -12,6 +12,8 @@ import triton.language as tl
 from dataclasses import dataclass
 
 
+
+
 # fused
 @triton.jit
 def seg_la_kernel(
@@ -326,32 +328,38 @@ def seg_la_p_kernel(
     tl.store(s_ptrs, state.to(S.dtype.element_ty))
 
 
+
 # used for speculative
 @triton.jit
 def seg_la_s_kernel(
-    Q,
-    K,
-    V,
-    S,
-    Out,
-    Mask,
-    softmax_scale,
-    stride_q,
-    stride_k,
-    stride_v,
-    stride_s,
-    stride_o,
-    s_offsets,
-    q_offsets,
-    q_lengths,
-    s_scales,
-    decay_scales,
-    HEAD_DIM: tl.constexpr,
-    K_SPLIT_DIM: tl.constexpr,
-    V_SPLIT_DIM: tl.constexpr,
-    BLOCK: tl.constexpr,
-    EVEN: tl.constexpr,
-):
+        Q,
+        K,
+        V,
+        KC,
+        VC,
+        S,
+        Out,
+        Mask,
+        softmax_scale,
+        stride_q,
+        stride_k,
+        stride_v,
+        stride_kc,
+        stride_vc,
+        stride_s,
+        stride_o,
+        s_offsets,
+        q_offsets,
+        q_lengths,
+        s_scales,
+        decay_scales,
+        HEAD_DIM: tl.constexpr,
+        K_SPLIT_DIM: tl.constexpr,
+        V_SPLIT_DIM: tl.constexpr,
+        BLOCK: tl.constexpr,
+        EVEN: tl.constexpr,
+        DUMP: tl.constexpr
+):  
     bid = tl.program_id(0)
     hid = tl.program_id(1)
     kvid = tl.program_id(2)
@@ -360,8 +368,8 @@ def seg_la_s_kernel(
     vid = kvid % N
     H = tl.num_programs(1)
 
-    # s_scale is 0 (first prefill chunk) or 1 (next prefill chunk)
-    s_scale = tl.load(s_scales + bid)
+    # s_scale is 0 (first prefill chunk) or 1 (next prefill chunk or decode)
+    s_scale = tl.load(s_scales+bid)
     q_length = tl.load(q_lengths + bid)
     q_offset = tl.load(q_offsets + bid)
     s_offset = tl.load(s_offsets + bid)
@@ -374,91 +382,95 @@ def seg_la_s_kernel(
     if s_offset == -1:
         return
 
+    #  (bs*mask_size, q_heads, d)
     q_ptrs = (
-        Q
-        + q_offset * stride_q
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_q + offs_k[None, :])
+            Q + q_offset * stride_q + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_q + offs_k[None, :])
     )
     k_ptrs = (
-        K
-        + q_offset * stride_k
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_k + offs_k[None, :])
+            K + q_offset * stride_k + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_k + offs_k[None, :])
     )
     v_ptrs = (
-        V
-        + q_offset * stride_v
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_b[:, None] * stride_v + offs_v[None, :])
+            V + q_offset * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM +  (
+                offs_b[:, None] * stride_v + offs_v[None, :])
     )
-    # (num_dim_block, length, qo_heads, d)
-    out_ptrs = (
-        Out
-        + kid * stride_o
-        + q_offset * HEAD_DIM * H
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
+    # (bs, kv_heads, d, d)
+    s_ptrs =  (
+            S + s_offset * stride_s + hid * HEAD_DIM * HEAD_DIM + kid * HEAD_DIM * K_SPLIT_DIM + vid * V_SPLIT_DIM + (
+                offs_k[:, None] * HEAD_DIM + offs_v[None, :])
     )
-    s_ptrs = (
-        S
-        + s_offset * stride_s
-        + hid * HEAD_DIM * HEAD_DIM
-        + kid * HEAD_DIM * K_SPLIT_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
-    )
-    state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
+    state = tl.load(s_ptrs, mask=s_scale>0).to(tl.float32)
 
     if EVEN:
         q = tl.load(q_ptrs).to(tl.float32)
-        k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
-        v = tl.load(v_ptrs).to(tl.float32)
-        mask = tl.load(
-            Mask
-            + bid * BLOCK * BLOCK
-            + tl.arange(0, BLOCK)[:, None] * BLOCK
-            + tl.arange(0, BLOCK)[None, :]
-        ).to(tl.int32)
+        if DUMP:
+            k = tl.load(k_ptrs)
+            # (bs, mask_size, kv_heads, d)
+            kc_ptrs = (KC + s_offset * stride_kc + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_k + offs_k[None, :]))
+            tl.store(kc_ptrs, k)
+            k = tl.trans(k).to(tl.float32)
+            v = tl.load(v_ptrs)
+            vc_ptrs = (VC + s_offset * stride_vc + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * stride_v + offs_v[None, :]))
+            tl.store(vc_ptrs, v)
+            v = v.to(tl.float32)
+        else:
+            k = tl.trans(tl.load(k_ptrs)).to(tl.float32)
+            v = tl.load(v_ptrs).to(tl.float32)
+
+        mask = tl.load(Mask + bid * BLOCK * BLOCK + tl.arange(0, BLOCK)[:,None]*BLOCK + tl.arange(0, BLOCK)[None,:]).to(tl.int32)
+        
         positions = tl.sum(mask, 1) - 1
         max_pos = tl.max(positions)
         b_offs = max_pos - positions
     else:
-        q = tl.load(q_ptrs, mask=offs_b[:, None] < q_length).to(tl.float32)
-        k = tl.trans(tl.load(k_ptrs, mask=offs_b[:, None] < q_length)).to(tl.float32)
-        v = tl.load(v_ptrs, mask=offs_b[:, None] < q_length).to(tl.float32)
-        mask = tl.load(
-            Mask
-            + bid * q_length * q_length
-            + tl.arange(0, BLOCK)[:, None] * q_length
-            + tl.arange(0, BLOCK)[None, :],
-            mask=(tl.arange(0, BLOCK)[:, None] < q_length)
-            & (tl.arange(0, BLOCK)[None, :] < q_length),
-        ).to(tl.int32)
+        q = tl.load(q_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
+        if DUMP:
+            k = tl.load(k_ptrs, mask=offs_b[:,None] < q_length)
+            # (bs, mask_size, kv_heads, d)
+            kc_ptrs = (KC + s_offset * stride_kc + hid * HEAD_DIM + kid * K_SPLIT_DIM + (
+                offs_b[:, None] * stride_k + offs_k[None, :]))
+            tl.store(kc_ptrs, k, mask=offs_b[:,None] < q_length)
+            k = tl.trans(k).to(tl.float32)
+            v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length)
+            vc_ptrs = (VC + s_offset * stride_vc + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * stride_v + offs_v[None, :]))
+            tl.store(vc_ptrs, v, mask=offs_b[:,None] < q_length)
+            v = v.to(tl.float32)
+        else:
+            k = tl.trans(tl.load(k_ptrs, mask=offs_b[:,None] < q_length)).to(tl.float32)
+            v = tl.load(v_ptrs, mask=offs_b[:,None] < q_length).to(tl.float32)
+        mask = tl.load(Mask + bid * q_length * q_length +
+                        tl.arange(0, BLOCK)[:,None]*q_length +
+                        tl.arange(0, BLOCK)[None,:],
+                        mask=(tl.arange(0, BLOCK)[:,None]<q_length) & (tl.arange(0, BLOCK)[None,:]<q_length)).to(tl.int32)
         positions = tl.sum(mask, 1) - 1
         max_pos = tl.max(positions)
         b_offs = max_pos - positions
 
     decays = tl.exp(decay_scale * b_offs)
-    inv_decays = 1 / decays
+    inv_decays = 1/decays
 
-    q = q * inv_decays[:, None]
-    k = k * decays[None, :]
+    q = q*inv_decays[:,None]
+    k = k*decays[None,:]
     qk = tl.dot(q, k) * softmax_scale
-    qk = qk * mask.to(tl.float32)
+    qk = qk*mask.to(tl.float32)
     o = tl.dot(qk, v)
 
-    block_decay = tl.exp(decay_scale * (max_pos + 1))
+    block_decay = tl.exp(decay_scale*(max_pos+1))
     o = tl.dot(q, state) * block_decay * softmax_scale + o
 
+    # (num_dim_block, length, qo_heads, d)
+    out_ptrs = (
+            Out + kid * stride_o + q_offset * HEAD_DIM * H + hid * HEAD_DIM + vid * V_SPLIT_DIM + (
+                offs_b[:, None] * H * HEAD_DIM + offs_v[None, :])
+    )
     if EVEN:
         tl.store(out_ptrs, o.to(Out.dtype.element_ty))
     else:
-        tl.store(out_ptrs, o.to(Out.dtype.element_ty), mask=offs_b[:, None] < q_length)
+        tl.store(out_ptrs, o.to(Out.dtype.element_ty), mask=offs_b[:,None] < q_length)
 
 
 # used for decode
@@ -532,6 +544,95 @@ def seg_la_d_kernel(
     tl.store(s_ptrs, state.to(S.dtype.element_ty))
 
 
+@triton.jit
+def seg_la_mtp_kernel(
+    Q,
+    K,
+    V,
+    S,
+    CACHES,
+    Out,
+    softmax_scale,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_s,
+    stride_c,
+    stride_o,
+    s_offsets,
+    decay_scales,
+    step,
+    HEAD_DIM: tl.constexpr,
+    K_SPLIT_DIM: tl.constexpr,
+    V_SPLIT_DIM: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+    kvid = tl.program_id(2)
+    N = HEAD_DIM // V_SPLIT_DIM
+    kid = kvid // N
+    vid = kvid % N
+    H = tl.num_programs(1)
+
+    s_offset = tl.load(s_offsets + bid)
+    if s_offset == -1:
+        return
+
+    decay_scale = tl.exp(-tl.load(decay_scales + hid))
+
+    offs_k = tl.arange(0, K_SPLIT_DIM)
+    offs_v = tl.arange(0, V_SPLIT_DIM)
+
+    # (length, qo_heads, d)
+    q_ptrs = Q + bid * step * stride_q + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_k)
+    k_ptrs = K + bid * step * stride_k + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_k)
+    v_ptrs = V + bid * step * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_v)
+    # (num_dim_block, length, qo_heads, d)
+    out_ptrs = (
+        Out
+        + kid * stride_o
+        + bid * step * H * HEAD_DIM
+        + hid * HEAD_DIM
+        + vid * V_SPLIT_DIM
+        + (offs_v)
+    )
+    # (bs, qo_heads, d, d)
+    s_ptrs = (
+        S
+        + s_offset * stride_s
+        + hid * HEAD_DIM * HEAD_DIM
+        + kid * HEAD_DIM * K_SPLIT_DIM
+        + vid * V_SPLIT_DIM
+        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+    )
+    state = tl.load(s_ptrs).to(tl.float32)
+    # (bs, step, kv_heads, d, d)
+    c_ptrs = (
+        CACHES
+        + s_offset * stride_c
+        + hid * HEAD_DIM * HEAD_DIM
+        + kid * HEAD_DIM * K_SPLIT_DIM
+        + vid * V_SPLIT_DIM
+        + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+    )
+
+    for i in range(step):
+        q = tl.load(q_ptrs).to(tl.float32) * softmax_scale
+        k = tl.load(k_ptrs).to(tl.float32)
+        v = tl.load(v_ptrs).to(tl.float32)
+
+        state = state * decay_scale + k[:, None] * v
+        o = tl.sum(q[:, None] * state, axis=0)
+
+        tl.store(out_ptrs, o.to(Out.dtype.element_ty))
+        tl.store(c_ptrs, state.to(CACHES.dtype.element_ty))
+        q_ptrs += stride_q
+        k_ptrs += stride_k
+        v_ptrs += stride_v
+        out_ptrs += H * HEAD_DIM
+        c_ptrs += H * HEAD_DIM * HEAD_DIM
+
+
 # (k_dim_block, length, qo_heads, d)
 @triton.jit
 def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
@@ -545,7 +646,8 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
     tl.store(O + pid * DIM + tl.arange(0, DIM), x)
 
 
-def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=False):
+
+def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, key_cache=None, value_cache=None, softmax_scale=None):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
@@ -562,13 +664,6 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=Fals
         # BLOCK should <= 64 with decouple
         K_SPLIT_DIM = 32
         V_SPLIT_DIM = 32 if bs <= 2 else 64
-        if meta.mask is None:
-            BLOCK = 32
-            EVEN = MAX_LENGTH % BLOCK == 0 if bs == 1 else False
-        else:
-            ms = meta.mask.size(-1)
-            BLOCK = (ms + 15) // 16 * 16
-            EVEN = BLOCK == ms
 
         num_warps = 2  # 2
         num_stages = 3  # 3
@@ -580,35 +675,113 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=Fals
         )
         grid = (bs, kv_heads, k_dim_block * v_dim_block)
 
-        kernel = seg_la_p_kernel if meta.mask is None else seg_la_s_kernel
-        mask = [] if meta.mask is None else [meta.mask]
+        if caches is not None:
+            # mtp 
+            EVEN = False
+            BLOCK = 32
+            step = length//bs
 
-        kernel[grid](
-            q,
-            k,
-            v,
-            s,
-            tmp,
-            *mask,
-            softmax_scale,
-            q.stride(0),
-            k.stride(0),
-            v.stride(0),
-            s.stride(0),
-            tmp.stride(0),
-            meta.s_offsets,
-            meta.q_offsets,
-            meta.q_lengths,
-            meta.s_scales,
-            decay_scales,
-            HEAD_DIM=HEAD_DIM,
-            K_SPLIT_DIM=K_SPLIT_DIM,
-            V_SPLIT_DIM=V_SPLIT_DIM,
-            BLOCK=BLOCK,
-            EVEN=EVEN,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+            seg_la_mtp_kernel[grid](
+                q,
+                k,
+                v,
+                s,
+                caches,
+                tmp,
+                softmax_scale,
+                q.stride(0),
+                k.stride(0),
+                v.stride(0),
+                s.stride(0),
+                caches.stride(0),
+                tmp.stride(0),
+                meta.s_offsets,
+                decay_scales,
+                step,
+                HEAD_DIM=HEAD_DIM,
+                K_SPLIT_DIM=K_SPLIT_DIM,
+                V_SPLIT_DIM=V_SPLIT_DIM,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+
+        elif meta.mask is not None:
+            # spec
+            ms = meta.mask.size(-1)
+            BLOCK = (ms + 15) // 16 * 16
+            EVEN = BLOCK == ms
+            # key_cache and value_cache are used to hold k&v in forward,
+            # they will be used in state updating stage
+            DUMP = key_cache is not None and value_cache is not None
+            if DUMP:
+                # (bs, mask_size, kv_heads, d)
+                kc_stride = key_cache.stride(0)
+                vc_stride = value_cache.stride(0)
+            else:
+                kc_stride = 0
+                vc_stride = 0
+            seg_la_s_kernel[grid](
+                q,
+                k,
+                v,
+                key_cache,
+                value_cache,
+                s,
+                tmp,
+                meta.mask,
+                softmax_scale,
+                q.stride(0),
+                k.stride(0),
+                v.stride(0),
+                kc_stride,
+                vc_stride,
+                s.stride(0),
+                tmp.stride(0),
+                meta.s_offsets,
+                meta.q_offsets,
+                meta.q_lengths,
+                meta.s_scales,
+                decay_scales,
+                HEAD_DIM=HEAD_DIM,
+                K_SPLIT_DIM=K_SPLIT_DIM,
+                V_SPLIT_DIM=V_SPLIT_DIM,
+                BLOCK=BLOCK,
+                EVEN=EVEN,
+                DUMP=DUMP,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+
+        else:
+            # prefill
+            BLOCK = 32 
+            EVEN = MAX_LENGTH % BLOCK == 0 if bs == 1 else False
+        
+            seg_la_p_kernel[grid](
+                q,
+                k,
+                v,
+                s,
+                tmp,
+                softmax_scale,
+                q.stride(0),
+                k.stride(0),
+                v.stride(0),
+                s.stride(0),
+                tmp.stride(0),
+                meta.s_offsets,
+                meta.q_offsets,
+                meta.q_lengths,
+                meta.s_scales,
+                decay_scales,
+                HEAD_DIM=HEAD_DIM,
+                K_SPLIT_DIM=K_SPLIT_DIM,
+                V_SPLIT_DIM=V_SPLIT_DIM,
+                BLOCK=BLOCK,
+                EVEN=EVEN,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
 
         if k_dim_block > 1:
             if length < 2048:

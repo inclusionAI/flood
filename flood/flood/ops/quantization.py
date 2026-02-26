@@ -15,7 +15,6 @@ try:
 except ImportError:
     pass
 
-
 @triton.jit
 def deprecated_static_int8_quant_kernel(
     x_ptr, y_ptr, static_scale, M, N, BLOCK_SIZE: tl.constexpr
