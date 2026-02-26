@@ -1,73 +1,159 @@
 
 
-<h1 align="center">Painless Inference Acceleration (PIA)</h1>
+<h1 align="center">FLOOD</h1>
 
 
   
 <p align="center">
-   A toolkit to accelerate LLM inference without headache (🤯) and tears (😭) .
+   FLOOD, a throughput-oriented framework with pipeline parallism and segmentable cache.
 </p>
 
 
-## NOTE
-
-  [2025/03] We have transitioned our open-source license from the `Creative Commons Attribution 4.0 International` to the `MIT` license. This change reflects our assessment that the MIT License is more appropriate for the distribution and utilization of source code.
-
 ## *News or Update* 🔥
-
-- [2025/03] We upgrade our inference framework `LOOKAHEAD` to [`FLOOD`](./flood/README.md).
-
-- [2024/05] We release the code of [`IPaD`](./ipad/README.md).
-
-- [2024/01] We support all models of baichuan family (Baichuan-7b & 13b, Baichuan2-7b & 13b) for lookahead.
-
-- [2024/01] We fully support repetition_penalty parameter for lookahead.
-
-- [2024/01] We support Mistral & Mixtral for lookahead.
-
-- [2023/12] We released our latency-oriented inference framework [`LOOKAHEAD`](./lookahead/README.md).
+- [2025/10] We support for Lookahead in hybrid linear models, including [Ring-mini-linear-2.0](https://huggingface.co/inclusionAI/Ring-mini-linear-2.0) and [Ring-flash-linear-2.0](https://huggingface.co/inclusionAI/Ring-flash-linear-2.0).
+- [2025/09] We release segment linear attention for better performance.
+- [2025/05] We integrade Lookahead into FLOOD.
+- [2025/03] We release the code of our inference framework `FLOOD`.
 
 
 ## Introduction
 
-Our repo, PIA (short for Painless Inference Acceleration), is designed for LLM inference, and currently contains three key features:
+Flood is a highly effective inference framework designed for offline applications. It employs a pipeline parallelism (PP) approach to minimize communication costs associated with tensor parallelism (TP). This framework incorporates advanced scheduling strategies tailored for offline inference processes to optimize GPU utilization to its fullest potential. 
 
-- [`FLOOD`](./flood/README.md): It employs pure pipeline parallelism to enhance inference throughput, thereby reducing communication costs typically associated with tensor parallelism. `FLOOD` is designed as the successor to our previous framework, `LOOKAHEAD`, in order to achieve optimal performance across both small and large batch sizes. `FLOOD` is an infenrence infra for our LLM Models [`Ling`](https://github.com/inclusionAI/Ling) and Multi-Agent framwork [`AWorld`](https://github.com/inclusionAI/AWorld?tab=readme-ov-file) 🚀.
+Furthermore, Flood utilizes segmentable blocks instead of paged blocks for kvcache management, thereby enhancing the continuity of the kvcache for requests.
+
+<div align=center>
+<img src="./figures/segcache.png" width="80%">
+</div>
+
+[//]: # (<div align=center>)
+
+[//]: # (<img src="https://github.com/alipay/PainlessInferenceAcceleration/blob/main/flood/figures/segcache.png" width="50%">)
+
+[//]: # (</div>)
+
+Additionally, we have developed an attention kernel, termed SegmentAttention, to function with the segmentable kvcache. Flood currently supports a range of features, including:
+- Zero-overhead continuous batching
+- Chunked prefill 
+- Inference of Quantization(FP8/INT8) models
+- Inference of multi-modal models
+- Streaming inference
+- PPL (Perplexity) evaluation
+- Sampling methods
+- Multi-node inference(experimental)
+
+Our framework is undergoing rapid iteration, which may result in some features having bugs. If you encounter any issues, please feel free to report them.
+
+## Models we support
+- Ling MoE Linear V1, V2
+- Ling MoE V1, V2
+- Ling
+- Llama
+- Qwen
+- Qwen3
+- Deepseek V1, V2, V3
+
+## Roadmap
+
+- Improve prefill performance with Prefix caching.
+
+- Improve performance with CUDA-Graph.
+
+- Implement segment attention with `CUTE` for better performance, especially with FP8 kvcache.
+
+- Reduce pickle/unpickle overhead in `multiprocessing.queue`.
+
+## Performance Comparison
 
 
-- [`LOOKAHEAD`](./lookahead/README.md): It uses an on-the-fly trie-tree cache to prepare hierarchical multi-branch drafts, without the demand for assist models (e.g., speculative decoding) or additional head training (e.g., block decoding). 
-With the efficient hierarchical structure, we can lookahead tens of branches, therefore significantly improve generated token count in a forward pass. It is important to note that `LOOKAHEAD` is fully based on `transformers`, which is inefficient for serving large models. Consequently, we have updated `LOOKAHEAD` to `FLOOD` and will maintain only minimal support for `LOOKAHEAD`.
+### Throughput
 
-- [`IPAD`](./ipad/README.md): It applies iterative pruning and distillation techniques to reduce the model size.
+Performance is measured by token/s(tokens per second) of generated tokens. The version of vLLM is 0.6.6.post2, we enable the chunk prefill with chunk size 2048, other parameters are the same as default. The model archetechure of Ling can be found in the [Ling technical report](https://github.com/inclusionAI/Ling/blob/master/Ling_Technical_Report_V1.pdf).
 
-Other features, including quantization, KV cache sparsification, will release soon. 
+
+| model    | dataset     | GPU      | vLLM | flood    | speedup |
+|-----------|-------------|----------|------------|----------|----------|
+| Llama3-8B | shareGPT  | 1*A100 |     3201   | 4529 | 1.41 |
+| Ling-Lite | shareGPT|  1 * H20  |  4355 | 5869 | 1.35 |
+| Ling-Lite | shareGPT|  1 * A100 | 3576 | 5451 | 1.52 |
+| Ling-Plus(FP8)| shareGPT | 8 * H20 | 2742 | 6569 | 2.40 |
+| Ring-Mini-Linear-V2 | shareGPT | 1 * A100 | 4992.03 | 6777.64 | 1.36 | 
+| Ring-Mini-Linear-V2 | shareGPT | 1 * H20 | 6016.04 | 9117.56 | 1.52 | 
+
+### Kernels
+#### Seg-attn
+Performance of Seg-attn is measured by TFLOPS (TFLOPs/second). Attention head number is 64, kv head number is 8, and kv head dimension is 128. We use `flash_attn_2_cuda.varlen_fwd` of flash-attn-2 in A100 and `flash_attn_3_cuda.fwd` of flash-attn-3 in H20. 
+More detail can be found in benchmark/ops/bench_seg_attn.py.
+
+| Device | BatchSize  |  Q_len   | K_len  | flash-attn | seg-attn | speedup |
+|---------|----------|----------|--------|-----------|---------|----------|
+|A100|  1  | 1024  | 1024 |     99.19 | 107.35 | 1.08 |
+|A100 | 128 | 1|  1024  |  10.65 | 13.56  | 1.27 |
+|H20|  1  | 1024  | 1024 |   90.28   | 96.05 | 1.06 |
+|H20 | 128 | 1|  1024  | 7.16  |  22.63 | 3.16 |
+
+#### Seg-linear-attn
+Performance of Seg-linear-attn is measured by microseconds(µs). Attention head number is 16, kv head number is 16, and kv head dimension is 128. 
+We use `fla.ops.simple_gla.chunk_simple_gla` of flash-linear-attention in prefilling and `fla.ops.simple_gla.fused_recurrent.fused_recurrent_simple_gla` of flash-linear-attention in decoding. The test device is H20.
+More detail can be found in benchmark/ops/bench_seg_la.py.
+
+| BatchSize | Seq_len | flash-linear-attention (µs) | seg-linear-attn (µs) | speedup |
+|:---------|:-------:|---------------------------:|---------------------:|-------:|
+| 1         | 1024    | 245.5                     | 180.1                | 1.36    |
+| 2         | 1024    | 227.4                     | 132.5                | 1.72    |
+| 64        | 1       | 129.5                     | 51.8                 | 2.50    |
+| 256       | 1       | 190.4                     | 132.0                | 1.44    |
+
+## Installation
+
+1. Clone this repository and navigate to PainlessInferenceAcceleration
+```
+git clone https://github.com/alipay/PainlessInferenceAcceleration.git
+cd PainlessInferenceAcceleration/flood
+```
+2. Install Package
+```
+python setup.py install
+```
+
+### requirements 
+
+We mainly develop and benchmark on the environment below, lower version may also be OK.
+
+- cuda >= 12.4 (higher is better)
+- torch >= 2.5.0 (higher is better)
+- triton >= 3.1.0 (higher is better) 
+- accelerate >= 1.4.0
+- transformers >= 4.54.0
+- flash-attn >= 2.6.3 is required if use `fa2` kernel 
+- flash-attn-3 >= 3.0.0 is required if use `fa3` kernel
+- vLLM >= 0.6.2 is required if use INT8 quantization
+
+
+## Quick Start
+
+A simple example can be found in `example/simple_example.py`.
+
+To reproduce the reported performance, run the `benchmark/bench_flood.py`.
+
+
+## ACKNOWLEDGE
+
+Flood is inspired by FlashAttention 2&3, FasterTransformer, vLLM, flashinfer projects.
 
 
 ## Citations
+
+[TBD]
 ```
-@inproceedings{10.1145/3637528.3671614,
-author = {Zhao, Yao and Xie, Zhitian and Liang, Chen and Zhuang, Chenyi and Gu, Jinjie},
-title = {Lookahead: An Inference Acceleration Framework for Large Language Model with Lossless Generation Accuracy},
-year = {2024},
-isbn = {9798400704901},
-publisher = {Association for Computing Machinery},
-doi = {10.1145/3637528.3671614},
-booktitle = {Proceedings of the 30th ACM SIGKDD Conference on Knowledge Discovery and Data Mining},
-pages = {6344–6355},
-series = {KDD '24}
+@misc{zhao2025flood,
+title={Flood: A throughput-oriented Inference Framework for Large Language Model with pipeline parallelism and segmentable cache},
+author={Yao Zhao and Chen Liang and Jingyu Hu and Zixuan Cheng and Zhen Wang and Longfei Li}
 }
 ```
 
-```
-@inproceedings{10.1145/3589335.3648321,
-author = {Wang, Maolin and Zhao, Yao and Liu, Jiajia and Chen, Jingdong and Zhuang, Chenyi and Gu, Jinjie and Guo, Ruocheng and Zhao, Xiangyu},
-title = {Large Multimodal Model Compression via Iterative Efficient Pruning and Distillation},
-year = {2024},
-isbn = {9798400701726},
-publisher = {Association for Computing Machinery},
-doi = {10.1145/3589335.3648321},
-booktitle = {Companion Proceedings of the ACM Web Conference 2024},
-pages = {235–244},
-series = {WWW '24}
-}
-```
+## Contact Us
+For technical questions and feature requests, please use Github issues or discussions. 
+
+
+
